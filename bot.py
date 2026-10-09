@@ -1,37 +1,34 @@
 import os
 import re
 import json
-import time
 import html
-import hashlib
 import logging
+import hashlib
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 
-# =====================================================
+# ==================================================
 # CONFIGURAZIONE
-# =====================================================
+# ==================================================
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
-
-SOURCE_CHANNELS = [
-    channel.strip().lstrip("@")
-    for channel in os.getenv(
-        "SOURCE_CHANNELS",
-        "offertedale,offertedalecasa,offervolt,scontiamolo",
-    ).split(",")
-    if channel.strip()
+CHANNELS = [
+    "offertedale",
+    "offertedalecasa",
+    "offervolt",
+    "scontiamolo",
 ]
 
 MAX_PRICE = 350.0
 MIN_DISCOUNT = 50
-POSTS_PER_CHANNEL = 25
-REQUEST_TIMEOUT = 20
+POSTS_PER_CHANNEL = 30
+REQUEST_TIMEOUT = 25
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
 STATE_FILE = Path("sent_deals.json")
 
@@ -44,151 +41,152 @@ session = requests.Session()
 session.headers.update({
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 Chrome/130.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
     )
 })
 
 
-# =====================================================
-# FILTRI PRODOTTI
-# =====================================================
+# ==================================================
+# RICONOSCIMENTO DEI ROBOT
+# ==================================================
 
 ROBOT_RE = re.compile(
     r"\b("
-    r"robot|robovac|roborock|roomba|ecovacs|narwal|yeedi|"
-    r"lubluelu|dreame|eufy|lefant|deebot|"
-    r"xiaomi\s+robot|"
-    r"mova\s+(?:p\d|v\d|z\d|e\d)|"
-    r"tapo\s+rv\d|switchbot\s+k\d"
+    r"robot\s+aspirapolvere|"
+    r"robot\s+lavapavimenti|"
+    r"robot\s+aspira(?:polvere|polveri)|"
+    r"aspirapolvere\s+robot|"
+    r"aspira(?:polvere|polveri)\s+robot|"
+    r"robot\s+lava(?:pavimenti|pavimento)|"
+    r"roomba|"
+    r"roborock|"
+    r"deebot|"
+    r"yeedi|"
+    r"lefant|"
+    r"dreame\s+(?:l\d|x\d|d\d|matrix|bot\b)|"
+    r"ecovacs\s+.{0,35}\b(?:robot|omni|t\d)\b|"
+    r"eufy\s+.{0,35}\b(?:robot|omni|x\d)\b|"
+    r"xiaomi\s+.{0,35}\b(?:robot|vacuum\s+s\d|s\d{2})\b"
     r")\b",
     re.IGNORECASE,
 )
 
-MANUAL_RE = re.compile(
+MANUAL_VACUUM_RE = re.compile(
     r"\b("
-    r"scopa elettrica|aspirapolvere a mano|"
-    r"aspirapolvere portatile|lavapavimenti manuale|"
-    r"tineco floor one|ricambio|accessorio|"
-    r"filtro di ricambio|spazzola di ricambio"
+    r"aspirapolvere\s+portatile|"
+    r"mini\s+aspirapolvere|"
+    r"aspirabriciole|"
+    r"scopa\s+elettrica|"
+    r"wet\s*(?:and|&)\s*dry\s+vacuum"
     r")\b",
     re.IGNORECASE,
 )
 
-PRICE_RE = re.compile(
-    r"(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?)\s*€"
-    r"|€\s*(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?)",
-    re.IGNORECASE,
-)
 
-DISCOUNT_RE = re.compile(
-    r"(?:sconto(?:\s+del)?\s*)(\d{1,2})\s*%"
-    r"|(\d{1,2})\s*%\s*(?:di\s*)?sconto",
-    re.IGNORECASE,
-)
+# ==================================================
+# LETTURA E SALVATAGGIO DEI DUPLICATI
+# ==================================================
 
-
-# =====================================================
-# STORICO NOTIFICHE
-# =====================================================
-
-def load_seen():
+def load_sent_deals():
     try:
         if STATE_FILE.exists():
-            data = json.loads(
-                STATE_FILE.read_text(encoding="utf-8")
-            )
+            with STATE_FILE.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+
             if isinstance(data, list):
                 return set(data)
-    except (OSError, json.JSONDecodeError) as exc:
-        logging.warning("Errore lettura storico: %s", exc)
+
+            if isinstance(data, dict):
+                return set(data.get("sent", []))
+
+    except (OSError, json.JSONDecodeError) as error:
+        logging.warning("Impossibile leggere lo storico: %s", error)
 
     return set()
 
 
-def save_seen(seen):
+def save_sent_deals(sent_deals):
     try:
-        STATE_FILE.write_text(
-            json.dumps(
-                sorted(seen)[-5000:],
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-    except OSError as exc:
-        logging.error("Errore salvataggio storico: %s", exc)
+        # Limita la dimensione dello storico.
+        recent = list(sent_deals)[-5000:]
+
+        with STATE_FILE.open("w", encoding="utf-8") as file:
+            json.dump(recent, file, ensure_ascii=False, indent=2)
+
+    except OSError as error:
+        logging.error("Impossibile salvare lo storico: %s", error)
 
 
-# =====================================================
-# TELEGRAM
-# =====================================================
+def deal_key(link, title):
+    parsed = urlparse(link)
 
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-    response = session.post(
-        url,
-        data={
-            "chat_id": CHAT_ID,
-            "text": message,
-            "disable_web_page_preview": False,
-        },
-        timeout=REQUEST_TIMEOUT,
+    match = re.search(
+        r"/(?:dp|gp/product)/([A-Z0-9]{10})",
+        parsed.path,
+        re.IGNORECASE,
     )
-    response.raise_for_status()
 
-    result = response.json()
-    if not result.get("ok"):
-        raise RuntimeError(
-            result.get("description", "Errore Telegram")
-        )
+    if match:
+        return "asin:" + match.group(1).upper()
+
+    normalized_title = re.sub(
+        r"\s+", " ", title.lower()
+    ).strip()
+
+    raw = normalized_title or link
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-# =====================================================
+# ==================================================
 # LINK AMAZON
-# =====================================================
+# ==================================================
 
 def normalize_amazon_link(url):
-    url = html.unescape((url or "").strip())
+    if not url:
+        return None
 
-    for _ in range(3):
-        parsed = urlparse(url)
-        query = parse_qs(parsed.query)
+    url = html.unescape(url.strip())
 
-        wrapped = (
-            query.get("url")
-            or query.get("q")
-            or query.get("u")
-        )
-
-        if not wrapped:
-            break
-
-        candidate = unquote(wrapped[0])
-        if not candidate.startswith(("http://", "https://")):
-            break
-
-        url = candidate
+    if url.startswith("//"):
+        url = "https:" + url
 
     parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https"):
+        return None
+
     host = (parsed.hostname or "").lower()
 
-    if host == "amzn.to":
-        return url
+    amazon_domains = (
+        "amazon.it",
+        "www.amazon.it",
+        "amzn.to",
+        "www.amzn.to",
+    )
 
-    if host == "amazon.it" or host.endswith(".amazon.it"):
-        return url
+    if not any(
+        host == domain or host.endswith("." + domain)
+        for domain in amazon_domains
+    ):
+        return None
 
-    return None
+    # Elimina i frammenti, conservando eventuali tag affiliato.
+    parsed = parsed._replace(fragment="")
+    return urlunparse(parsed)
 
 
-# =====================================================
-# LETTURA DEI CANALI
-# =====================================================
+# ==================================================
+# LETTURA DEI POST TELEGRAM
+# ==================================================
 
 def get_channel_posts(channel):
     url = f"https://t.me/s/{channel}"
-    response = session.get(url, timeout=REQUEST_TIMEOUT)
+
+    response = session.get(
+        url,
+        timeout=REQUEST_TIMEOUT,
+    )
     response.raise_for_status()
 
     soup = BeautifulSoup(response.text, "html.parser")
@@ -202,24 +200,49 @@ def get_channel_posts(channel):
         if not text_element:
             continue
 
-        text = text_element.get_text(" ", strip=True)
+        links = []
+
+        def extract_text_with_links(node):
+            parts = []
+
+            for child in node.children:
+                if isinstance(child, NavigableString):
+                    parts.append(str(child))
+
+                elif isinstance(child, Tag):
+                    if child.name == "a":
+                        link = normalize_amazon_link(
+                            child.get("href", "")
+                        )
+
+                        if link:
+                            if link not in links:
+                                links.append(link)
+
+                            index = links.index(link)
+                            parts.append(f" [[LINK_{index}]] ")
+
+                        else:
+                            parts.append(
+                                child.get_text(" ", strip=False)
+                            )
+                    else:
+                        parts.append(
+                            extract_text_with_links(child)
+                        )
+
+            return "".join(parts)
+
+        text = extract_text_with_links(text_element)
         text = re.sub(r"\s+", " ", text).strip()
 
         if not text:
             continue
 
-        links = []
-
-        for anchor in text_element.select("a[href]"):
-            link = normalize_amazon_link(
-                anchor.get("href", "")
-            )
-            if link and link not in links:
-                links.append(link)
-
         date_element = element.select_one(
             ".tgme_widget_message_date"
         )
+
         post_url = (
             date_element.get("href", "")
             if date_element else ""
@@ -227,8 +250,10 @@ def get_channel_posts(channel):
 
         if not post_url:
             data_post = element.select_one("[data-post]")
+
             if data_post:
                 post_id = data_post.get("data-post", "")
+
                 if "/" in post_id:
                     post_url = "https://t.me/" + post_id
 
@@ -241,111 +266,95 @@ def get_channel_posts(channel):
     return posts[-POSTS_PER_CHANNEL:]
 
 
-# =====================================================
-# DIVISIONE DEI PRODOTTI
-# =====================================================
+# ==================================================
+# DIVISIONE DEI POST IN SINGOLI PRODOTTI
+# ==================================================
 
 def split_products(text):
-    # Formato numerato: 1) prodotto, 2) prodotto...
-    numbered = re.split(
-        r"(?:^|\s)\**\s*\d{1,2}\s*\)\s*\**\s*",
-        text,
+    # Individua prodotti numerati: 1), 2), 3)...
+    pattern = re.compile(
+        r"(?<!\S)\s*\d{1,2}\s*\)\s*"
     )
 
-    products = [
-        chunk.strip()
-        for chunk in numbered
-        if chunk.strip()
-    ]
+    matches = list(pattern.finditer(text))
 
-    if len(products) > 1:
+    if matches:
+        products = []
+
+        for index, match in enumerate(matches):
+            start = match.start()
+            end = (
+                matches[index + 1].start()
+                if index + 1 < len(matches)
+                else len(text)
+            )
+
+            product = text[start:end].strip()
+
+            if product:
+                products.append(product)
+
         return products
 
-    # Formato con separatore 📌.
+    # Alcuni canali separano le offerte con una puntina.
     if "📌" in text:
-        chunks = re.split(r"📌", text)
         products = [
-            chunk.strip()
-            for chunk in chunks
-            if chunk.strip()
+            part.strip()
+            for part in text.split("📌")
+            if part.strip()
         ]
 
-        if len(products) > 1:
+        if products:
             return products
 
-    return [text.strip()]
+    return [text.strip()] if text.strip() else []
 
 
-# =====================================================
-# ASSOCIAZIONE LINK E PRODOTTI
-# =====================================================
+def assign_link(product, links):
+    # Il link viene scelto usando il riferimento inserito
+    # nel testo HTML, non la posizione generica nella lista.
+    match = re.search(r"\[\[LINK_(\d+)\]\]", product)
 
-def assign_links(products, links):
-    if not products or not links:
-        return []
+    if match:
+        index = int(match.group(1))
 
-    # Un solo prodotto nel post: usa il primo link Amazon.
-    if len(products) == 1:
-        return [(products[0], links[0])]
+        if 0 <= index < len(links):
+            return links[index]
 
-    # Stesso numero di prodotti e link: associa in ordine.
-    if len(products) == len(links):
-        return list(zip(products, links))
+    # Fallback prudente: un solo link per un solo prodotto.
+    if len(links) == 1:
+        return links[0]
 
-    # Conteggi diversi: prova ad associare i link usando
-    # il codice ASIN Amazon, quando presente nel testo.
-    assigned = []
-    used_links = set()
-
-    def asin(value):
-        match = re.search(
-            r"/dp/([A-Z0-9]{10})|/gp/product/([A-Z0-9]{10})",
-            value,
-            re.IGNORECASE,
-        )
-        if not match:
-            return None
-        return (match.group(1) or match.group(2)).upper()
-
-    for product in products:
-        product_asins = {
-            code.upper()
-            for code in re.findall(
-                r"\b[A-Z0-9]{10}\b",
-                product,
-                re.IGNORECASE,
-            )
-        }
-
-        matches = []
-
-        for index, link in enumerate(links):
-            if index in used_links:
-                continue
-
-            link_asin = asin(link)
-
-            if link_asin and link_asin in product_asins:
-                matches.append(index)
-
-        if len(matches) == 1:
-            index = matches[0]
-            used_links.add(index)
-            assigned.append((product, links[index]))
-
-    return assigned
+    # Non indovinare se ci sono più link non associabili.
+    return None
 
 
-# =====================================================
+# ==================================================
 # PREZZI E SCONTI
-# =====================================================
+# ==================================================
+
+PRICE_RE = re.compile(
+    r"(?<!\w)("
+    r"\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?"
+    r"|\d+(?:,\d{1,2})?"
+    r")\s*€"
+    r"|€\s*("
+    r"\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?"
+    r"|\d+(?:,\d{1,2})?"
+    r")",
+    re.IGNORECASE,
+)
+
 
 def parse_number(value):
-    value = value.strip().replace(".", "").replace(",", ".")
+    if not value:
+        return None
 
     try:
-        return float(value)
-    except ValueError:
+        return float(
+            value.replace(".", "").replace(",", ".")
+        )
+    except (ValueError, AttributeError):
         return None
 
 
@@ -353,234 +362,294 @@ def extract_prices(text):
     prices = []
 
     for match in PRICE_RE.finditer(text):
-        raw = match.group(1) or match.group(2)
+        value = match.group(1) or match.group(2)
+        price = parse_number(value)
 
-        if not raw:
-            continue
-
-        price = parse_number(raw)
-
-        if price is not None and 1 <= price <= 10000:
+        if price is not None:
             prices.append(price)
 
     return prices
 
 
-def extract_discount(text, prices):
-    match = DISCOUNT_RE.search(text)
+def extract_discount(text):
+    prices = extract_prices(text)
 
-    if match:
-        raw = match.group(1) or match.group(2)
-        return int(raw)
-
-    # Calcola lo sconto usando i due prezzi quando disponibili.
     if len(prices) >= 2:
-        current = prices[0]
-        old = prices[1]
+        current_price = prices[0]
+        old_price = prices[1]
 
-        if old > current:
-            return round((old - current) / old * 100)
+        if old_price > 0 and old_price > current_price:
+            discount = round(
+                (old_price - current_price) / old_price * 100
+            )
 
-    return None
+            return current_price, old_price, discount
 
-
-def extract_current_price(text, prices):
-    # I post delle offerte spesso indicano:
-    # 399,00€ invece di 699,00€
-    match = re.search(
-        r"(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?)\s*€"
-        r"\s*(?:invece di|anziché|anziche|prima era)",
+    # Fallback per i post che dichiarano lo sconto in percentuale.
+    percent_match = re.search(
+        r"(?:sconto|risparmio|offerta)\s*[:\-]?\s*"
+        r"(\d{1,2})\s*%",
         text,
         re.IGNORECASE,
     )
 
-    if match:
-        price = parse_number(match.group(1))
-        if price is not None:
-            return price
+    if percent_match and prices:
+        return prices[0], None, int(percent_match.group(1))
 
-    # Altrimenti usa il primo prezzo trovato.
-    if prices:
-        return prices[0]
-
-    return None
+    return None, None, None
 
 
-# =====================================================
-# FILTRO E CREAZIONE OFFERTA
-# =====================================================
+# ==================================================
+# PREPARAZIONE DELLE OFFERTE
+# ==================================================
 
-def is_robot_product(text):
-    if not ROBOT_RE.search(text):
+def clean_product_text(text):
+    text = re.sub(r"\[\[LINK_\d+\]\]", " ", text)
+    text = re.sub(r"^\s*\d{1,2}\s*\)\s*", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" \t\n-–—|")
+
+
+def is_robot_product(title):
+    if MANUAL_VACUUM_RE.search(title):
         return False
 
-    if MANUAL_RE.search(text):
-        return False
-
-    return True
+    return bool(ROBOT_RE.search(title))
 
 
-def build_deal(channel, product_text, link, post_url):
-    if not is_robot_product(product_text):
+def build_deal(product, links, channel, post_url):
+    link = assign_link(product, links)
+
+    if not link:
+        logging.warning(
+            "@%s: link non associabile al prodotto: %s",
+            channel,
+            clean_product_text(product)[:100],
+        )
         return None
 
-    prices = extract_prices(product_text)
-    current_price = extract_current_price(product_text, prices)
-    discount = extract_discount(product_text, prices)
+    title = clean_product_text(product)
+
+    if not title or not is_robot_product(title):
+        return None
+
+    current_price, old_price, discount = extract_discount(product)
 
     if current_price is None:
+        logging.info(
+            "@%s: prezzo non riconosciuto: %s",
+            channel,
+            title[:100],
+        )
         return None
 
-    if current_price > MAX_PRICE:
+    if current_price <= 0 or current_price > MAX_PRICE:
+        logging.info(
+            "@%s: prezzo fuori limite (%.2f €): %s",
+            channel,
+            current_price,
+            title[:100],
+        )
         return None
 
     if discount is None or discount < MIN_DISCOUNT:
-        return None
-
-    product_name = re.sub(r"\s+", " ", product_text).strip()
-
-    if len(product_name) > 450:
-        product_name = product_name[:447] + "..."
-
-    if not link:
-        link = post_url
-
-    if not link:
+        logging.info(
+            "@%s: sconto inferiore al %s%% o non verificabile: %s",
+            channel,
+            MIN_DISCOUNT,
+            title[:100],
+        )
         return None
 
     return {
-        "name": product_name,
-        "price": current_price,
-        "discount": discount,
+        "title": title,
         "link": link,
+        "price": current_price,
+        "old_price": old_price,
+        "discount": discount,
         "channel": channel,
+        "post_url": post_url,
     }
 
 
-def make_key(channel, post_url, name, link):
-    raw = f"{channel}|{post_url}|{link or name}".lower()
+# ==================================================
+# INVIO TELEGRAM
+# ==================================================
 
-    return hashlib.sha256(
-        raw.encode("utf-8")
-    ).hexdigest()
+def send_telegram_message(deal):
+    if not BOT_TOKEN or not CHAT_ID:
+        logging.error(
+            "Mancano i segreti BOT_TOKEN o CHAT_ID su GitHub."
+        )
+        return False
 
+    title = html.escape(deal["title"])
+    link = html.escape(deal["link"], quote=True)
+    channel = html.escape(deal["channel"])
 
-# =====================================================
-# CONTROLLO CANALI
-# =====================================================
+    price_text = f'{deal["price"]:.2f} €'.replace(".", ",")
 
-def check_channel(channel, seen):
-    logging.info("Controllo canale: @%s", channel)
+    if deal["old_price"] is not None:
+        old_price_text = (
+            f'{deal["old_price"]:.2f} €'.replace(".", ",")
+        )
+        price_line = (
+            f"💶 Prezzo: <b>{price_text}</b>\n"
+            f"🏷️ Prezzo precedente: {old_price_text}\n"
+        )
+    else:
+        price_line = f"💶 Prezzo: <b>{price_text}</b>\n"
 
-    notifications = 0
-    ambiguous = 0
-
-    try:
-        posts = get_channel_posts(channel)
-    except requests.RequestException as exc:
-        logging.error("Errore lettura @%s: %s", channel, exc)
-        return notifications, ambiguous
-
-    for post in posts:
-        text = post["text"]
-
-        if not ROBOT_RE.search(text):
-            continue
-
-        products = split_products(text)
-        links = post["links"]
-        pairs = assign_links(products, links)
-
-        if not pairs:
-            ambiguous += 1
-            logging.warning(
-                "@%s: link non associabili nel post %s",
-                channel,
-                post["url"] or "(URL non disponibile)",
-            )
-            continue
-
-        for product_text, link in pairs:
-            deal = build_deal(
-                channel,
-                product_text,
-                link,
-                post["url"],
-            )
-
-            if not deal:
-                continue
-
-            key = make_key(
-                channel,
-                post["url"],
-                deal["name"],
-                deal["link"],
-            )
-
-            if key in seen:
-                continue
-
-            message = (
-                "🤖 OFFERTA ROBOT\n\n"
-                f"{deal['name']}\n\n"
-                f"💶 Prezzo: {deal['price']:.2f} €\n"
-                f"🔥 Sconto: {deal['discount']}%\n"
-                f"📢 Canale: @{deal['channel']}\n\n"
-                f"🛒 Acquista: {deal['link']}"
-            )
-
-            try:
-                send_telegram(message)
-            except (requests.RequestException, RuntimeError) as exc:
-                logging.error("Errore invio Telegram: %s", exc)
-                continue
-
-            seen.add(key)
-            save_seen(seen)
-            notifications += 1
-
-            logging.info(
-                "Notifica inviata da @%s",
-                channel,
-            )
-
-            time.sleep(1)
-
-    logging.info(
-        "@%s: nuove notifiche %s, post ambigui %s",
-        channel,
-        notifications,
-        ambiguous,
+    message = (
+        "🤖 <b>OFFERTA ROBOT ASPIRAPOLVERE</b>\n\n"
+        f"📦 {title}\n\n"
+        f"{price_line}"
+        f"🔥 Sconto: <b>{deal['discount']}%</b>\n"
+        f"📢 Canale: @{channel}\n\n"
+        f'🛒 <a href="{link}">VEDI OFFERTA AMAZON</a>'
     )
 
-    return notifications, ambiguous
+    if deal["post_url"]:
+        post_url = html.escape(
+            deal["post_url"],
+            quote=True,
+        )
+        message += (
+            f'\n\n🔎 <a href="{post_url}">'
+            "Post originale</a>"
+        )
+
+    api_url = (
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    )
+
+    try:
+        response = session.post(
+            api_url,
+            data={
+                "chat_id": CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        response.raise_for_status()
+        result = response.json()
+
+        if not result.get("ok"):
+            logging.error(
+                "Telegram ha rifiutato il messaggio: %s",
+                result,
+            )
+            return False
+
+        return True
+
+    except (requests.RequestException, ValueError) as error:
+        logging.error(
+            "Errore durante l'invio Telegram: %s",
+            error,
+        )
+        return False
 
 
-# =====================================================
-# AVVIO
-# =====================================================
+# ==================================================
+# CONTROLLO DEI CANALI
+# ==================================================
 
 def main():
-    seen = load_seen()
+    sent_deals = load_sent_deals()
+    new_count = 0
+    ambiguous_count = 0
 
-    total_notifications = 0
-    total_ambiguous = 0
+    logging.info("Avvio controllo offerte.")
+    logging.info(
+        "Prezzo massimo: %.2f € | Sconto minimo: %s%%",
+        MAX_PRICE,
+        MIN_DISCOUNT,
+    )
 
-    for channel in SOURCE_CHANNELS:
-        notifications, ambiguous = check_channel(channel, seen)
+    for channel in CHANNELS:
+        logging.info("Controllo canale: @%s", channel)
 
-        total_notifications += notifications
-        total_ambiguous += ambiguous
+        try:
+            posts = get_channel_posts(channel)
+
+        except requests.RequestException as error:
+            logging.error(
+                "Errore nella lettura di @%s: %s",
+                channel,
+                error,
+            )
+            continue
+
+        channel_new = 0
+
+        for post in posts:
+            products = split_products(post["text"])
+
+            for product in products:
+                # Ignora il testo introduttivo senza offerte.
+                if not is_robot_product(clean_product_text(product)):
+                    continue
+
+                deal = build_deal(
+                    product=product,
+                    links=post["links"],
+                    channel=channel,
+                    post_url=post["url"],
+                )
+
+                if not deal:
+                    # Un prodotto fuori dai limiti viene ignorato.
+                    # Un link non associabile viene già registrato
+                    # nel log da build_deal.
+                    if (
+                        is_robot_product(clean_product_text(product))
+                        and not assign_link(product, post["links"])
+                    ):
+                        ambiguous_count += 1
+                    continue
+
+                key = deal_key(deal["link"], deal["title"])
+
+                if key in sent_deals:
+                    logging.info(
+                        "Duplicato ignorato: %s",
+                        deal["title"][:100],
+                    )
+                    continue
+
+                if send_telegram_message(deal):
+                    sent_deals.add(key)
+                    new_count += 1
+                    channel_new += 1
+
+                    # Salva subito dopo ogni invio riuscito.
+                    save_sent_deals(sent_deals)
+
+                    logging.info(
+                        "Notifica inviata: %s",
+                        deal["title"][:100],
+                    )
+
+        logging.info(
+            "@%s: nuove notifiche %s",
+            channel,
+            channel_new,
+        )
+
+    save_sent_deals(sent_deals)
 
     logging.info(
         "Controllo completato. Nuove notifiche: %s",
-        total_notifications,
+        new_count,
     )
-
     logging.info(
-        "Post con associazione ambigua: %s",
-        total_ambiguous,
+        "Prodotti con link non associabile: %s",
+        ambiguous_count,
     )
 
 
