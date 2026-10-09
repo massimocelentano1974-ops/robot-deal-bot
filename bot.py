@@ -9,15 +9,21 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 
-# Impostazioni Telegram: usa i segreti già salvati su GitHub
+# Segreti GitHub già configurati: non inserire qui il token
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
-# Canale pubblico Telegram da controllare
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "offertedale")
-SOURCE_URL = f"https://t.me/s/{SOURCE_CHANNEL}"
+# Canali Telegram da controllare
+SOURCE_CHANNELS = [
+    channel.strip().lstrip("@")
+    for channel in os.getenv(
+        "SOURCE_CHANNELS",
+        "offertedale,offertedalecasa,offervolt,scontiamolo",
+    ).split(",")
+    if channel.strip()
+]
 
-# Regole delle offerte
+# Filtri delle offerte
 MAX_PRICE = 350.0
 MIN_DISCOUNT = 50
 
@@ -27,49 +33,38 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; RobotDealBot/1.0)"
 }
 
-# Parole e marchi associati ai robot autonomi
+# Richiede un riferimento esplicito a un robot
 ROBOT_RE = re.compile(
-    r"\b("
-    r"robot aspirapolvere|"
-    r"robot lavapavimenti|"
-    r"robot aspirapolvere e lavapavimenti|"
-    r"robot aspirapolvere lavapavimenti|"
-    r"robot aspirapolvere e lava pavimenti|"
-    r"robot vacuum|"
-    r"robot mop|"
-    r"robot vacuum cleaner|"
-    r"robot lavapavimenti automatico|"
-    r"roborock|roomba|ecovacs|narwal|yeedi|lubluelu"
-    r")\b",
+    r"\b(robot|robotico|robotica|robotizzati|robotizzata)\b",
     re.IGNORECASE,
 )
 
-# Esclusioni per ridurre i falsi positivi dei prodotti manuali
+# Esclude prodotti manuali riconoscibili
 MANUAL_RE = re.compile(
-    r"\b("
-    r"tineco|"
-    r"floor\s*one|"
-    r"wet\s*(?:&|and|-)?\s*dry|"
-    r"aspirapolvere senza fili|"
-    r"scopa elettrica|"
-    r"aspirapolvere a mano|"
-    r"aspirapolvere manuale"
-    r")\b",
+    r"\b(tineco|floor\s*one|scopa elettrica|"
+    r"aspirapolvere a mano|aspirapolvere portatile|"
+    r"lavapavimenti manuale)\b",
     re.IGNORECASE,
 )
 
-# Prezzi come 199 €, €199, 199,99 € oppure €199,99
+# Prezzi con simbolo euro, ad esempio 249,99 € o €249.99
 PRICE_RE = re.compile(
-    r"(?:€\s*)(\d{1,4}(?:[.,]\d{1,2})?)"
+    r"€\s*(\d{1,4}(?:[.,]\d{1,2})?)"
     r"|(\d{1,4}(?:[.,]\d{1,2})?)\s*€",
     re.IGNORECASE,
 )
 
-# Sconti espliciti, ad esempio "70% sconto"
-DISCOUNT_RE = re.compile(
-    r"(\d{1,3})\s*%\s*(?:di\s*)?sconto",
-    re.IGNORECASE,
-)
+# Riconosce sia "73% di sconto" sia "sconto del 73%"
+DISCOUNT_PATTERNS = [
+    re.compile(
+        r"(\d{1,3})\s*%\s*(?:di\s*)?sconto",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bsconto\s*(?:del|di)?\s*(\d{1,3})\s*%",
+        re.IGNORECASE,
+    ),
+]
 
 
 def load_state():
@@ -119,13 +114,34 @@ def extract_prices(text):
 
         try:
             price = parse_number(raw)
-
             if 1 <= price <= 10000:
                 prices.append(price)
         except ValueError:
             continue
 
     return prices
+
+
+def extract_discount(text, prices):
+    discount = 0
+
+    for pattern in DISCOUNT_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = int(match.group(1))
+            if 0 <= value <= 100:
+                discount = value
+                break
+
+    # Se il testo contiene prezzo attuale e prezzo precedente,
+    # prova a calcolare lo sconto.
+    if len(prices) >= 2 and prices[1] > prices[0]:
+        calculated = round(
+            (prices[1] - prices[0]) / prices[1] * 100
+        )
+        discount = max(discount, calculated)
+
+    return discount
 
 
 def get_amazon_links(post):
@@ -147,7 +163,7 @@ def get_amazon_links(post):
 
 
 def split_products(text):
-    # Se il post contiene prodotti numerati, separali.
+    # Se il post è numerato, separa i prodotti.
     markers = list(
         re.finditer(r"(?m)(?:^|\s)(\d{1,2})\)\s*", text)
     )
@@ -157,7 +173,6 @@ def split_products(text):
 
         for index, marker in enumerate(markers):
             start = marker.end()
-
             end = (
                 markers[index + 1].start()
                 if index + 1 < len(markers)
@@ -171,7 +186,7 @@ def split_products(text):
 
         return products
 
-    # Nei post non numerati, considera il post come un prodotto.
+    # Per i post non numerati, considera il post intero.
     if ROBOT_RE.search(text):
         return [text]
 
@@ -199,18 +214,23 @@ def send_telegram(message):
         )
 
 
-def main():
-    response = requests.get(
-        SOURCE_URL,
-        headers=HEADERS,
-        timeout=30,
-    )
-    response.raise_for_status()
+def check_channel(channel, sent):
+    source_url = f"https://t.me/s/{channel}"
+
+    print(f"Controllo canale: @{channel}")
+
+    try:
+        response = requests.get(
+            source_url,
+            headers=HEADERS,
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        print(f"Canale @{channel} non leggibile: {error}")
+        return 0, 0
 
     soup = BeautifulSoup(response.text, "html.parser")
-
-    state = load_state()
-    sent = set(state.get("sent", []))
 
     found = 0
     skipped = 0
@@ -230,17 +250,25 @@ def main():
         if not products or not links:
             continue
 
-        # Non associare link e prodotti se il numero non coincide.
+        # Non associare prodotti e link se il numero differisce.
         if len(products) != len(links):
             skipped += 1
             continue
 
+        date_link = post.select_one(
+            "a.tgme_widget_message_date"
+        )
+
+        source_link = (
+            date_link.get("href")
+            if date_link and date_link.get("href")
+            else source_url
+        )
+
         for product_text, link in zip(products, links):
-            # Deve sembrare un robot autonomo.
             if not ROBOT_RE.search(product_text):
                 continue
 
-            # Escludi prodotti manuali riconoscibili.
             if MANUAL_RE.search(product_text):
                 continue
 
@@ -249,37 +277,18 @@ def main():
             if not prices:
                 continue
 
-            # Il primo prezzo è considerato quello in offerta.
             current_price = prices[0]
 
-            # Il prezzo finale deve essere al massimo 300 €.
             if current_price > MAX_PRICE:
                 continue
 
-            # Leggi lo sconto dichiarato nel testo.
-            discount_match = DISCOUNT_RE.search(product_text)
+            discount = extract_discount(product_text, prices)
 
-            if discount_match:
-                discount = int(discount_match.group(1))
-            else:
-                discount = 0
-
-            # Se ci sono due prezzi, calcola anche lo sconto.
-            if len(prices) >= 2 and prices[1] > current_price:
-                calculated_discount = int(
-                    (prices[1] - current_price)
-                    / prices[1]
-                    * 100
-                )
-
-                discount = max(discount, calculated_discount)
-
-            # Accetta tutti gli sconti dal 50% in su:
-            # 50, 60, 70, 80, 90 e anche 100.
             if discount < MIN_DISCOUNT:
                 continue
 
-            # Evita di inviare di nuovo la stessa offerta.
+            # La stessa offerta trovata su più canali
+            # viene notificata una sola volta.
             fingerprint = hashlib.sha256(
                 f"{product_text}|{link}".encode("utf-8")
             ).hexdigest()[:20]
@@ -287,37 +296,55 @@ def main():
             if fingerprint in sent:
                 continue
 
-            date_link = post.select_one(
-                "a.tgme_widget_message_date"
-            )
-
-            source_link = (
-                date_link.get("href")
-                if date_link and date_link.get("href")
-                else SOURCE_URL
-            )
-
             message = (
-                "🤖 OFFERTA ROBOT AUTONOMO\n\n"
+                "🤖 POSSIBILE OFFERTA ROBOT AUTONOMO\n\n"
                 f"{product_text[:900]}\n\n"
                 f"Prezzo individuato: {current_price:.2f} €\n"
                 f"Sconto individuato: {discount}%\n"
+                f"Canale: @{channel}\n"
                 f"Link Amazon: {link}\n"
                 f"Fonte: {source_link}\n\n"
-                "Controlla su Amazon il prezzo finale, "
+                "Verifica su Amazon il prezzo finale, "
                 "il modello e il venditore prima di acquistare."
             )
 
-            send_telegram(message)
+            try:
+                send_telegram(message)
+            except (requests.RequestException, RuntimeError) as error:
+                print(f"Errore invio Telegram: {error}")
+                continue
 
             sent.add(fingerprint)
             found += 1
 
+    print(
+        f"@{channel}: nuove notifiche {found}, "
+        f"post ignorati per link non associabili {skipped}"
+    )
+
+    return found, skipped
+
+
+def main():
+    state = load_state()
+    sent = set(state.get("sent", []))
+
+    total_found = 0
+    total_skipped = 0
+
+    for channel in SOURCE_CHANNELS:
+        found, skipped = check_channel(channel, sent)
+        total_found += found
+        total_skipped += skipped
+
     state["sent"] = list(sent)[-1000:]
     save_state(state)
 
-    print(f"Controllo completato. Nuove notifiche: {found}")
-    print(f"Post ignorati per link non associabili: {skipped}")
+    print(f"Controllo completato. Nuove notifiche: {total_found}")
+    print(
+        "Post ignorati per link non associabili: "
+        f"{total_skipped}"
+    )
 
 
 if __name__ == "__main__":
