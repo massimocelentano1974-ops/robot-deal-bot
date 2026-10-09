@@ -13,8 +13,8 @@ CHAT_ID = os.environ["CHAT_ID"]
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "offertedale")
 
 MAX_PRICE = 300.0
-VERY_LOW_PRICE = 150.0
-MIN_DISCOUNT = 40
+VERY_LOW_PRICE = 0.0
+MIN_DISCOUNT = 50
 
 SOURCE_URL = f"https://t.me/s/{SOURCE_CHANNEL}"
 STATE_FILE = Path("state.json")
