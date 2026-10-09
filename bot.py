@@ -228,11 +228,9 @@ def main():
                 discount = max(discount, calculated_discount)
 
             if (
-                current_price > VERY_LOW_PRICE
-                and discount < MIN_DISCOUNT
-            ):
+                if discount < MIN_DISCOUNT:
                 continue
-
+     
             fingerprint = hashlib.sha256(
                 f"{product_text}|{link}".encode("utf-8")
             ).hexdigest()[:20]
