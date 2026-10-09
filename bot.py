@@ -1,3 +1,4 @@
+```python
 import os
 import re
 import json
@@ -9,12 +10,12 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 
-# ==================================================
+# =====================================================
 # CONFIGURAZIONE
-# ==================================================
+# =====================================================
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
@@ -30,7 +31,6 @@ SOURCE_CHANNELS = [
 
 MAX_PRICE = 350.0
 MIN_DISCOUNT = 50
-
 POSTS_PER_CHANNEL = 25
 REQUEST_TIMEOUT = 20
 
@@ -50,35 +50,27 @@ session.headers.update({
 })
 
 
-# ==================================================
-# FILTRI PRODOTTI
-# ==================================================
+# =====================================================
+# FILTRI
+# =====================================================
 
 ROBOT_RE = re.compile(
     r"\b("
     r"robot|robovac|roborock|roomba|ecovacs|narwal|yeedi|"
-    r"lubluelu|dreame|eufy|lefant|"
+    r"lubluelu|dreame|eufy|lefant|deebot|"
     r"xiaomi\s+robot|"
-    r"deebot|"
-    r"i[\s-]?robot|"
     r"mova\s+(?:p\d|v\d|z\d|e\d)|"
-    r"tapo\s+rv\d|"
-    r"switchbot\s+k\d"
+    r"tapo\s+rv\d|switchbot\s+k\d"
     r")\b",
     re.IGNORECASE,
 )
 
 MANUAL_RE = re.compile(
     r"\b("
-    r"scopa elettrica|"
-    r"aspirapolvere a mano|"
-    r"aspirapolvere portatile|"
-    r"lavapavimenti manuale|"
-    r"tineco floor one|"
-    r"ricambio|"
-    r"accessorio|"
-    r"filtro di ricambio|"
-    r"spazzola di ricambio"
+    r"scopa elettrica|aspirapolvere a mano|"
+    r"aspirapolvere portatile|lavapavimenti manuale|"
+    r"tineco floor one|ricambio|accessorio|"
+    r"filtro di ricambio|spazzola di ricambio"
     r")\b",
     re.IGNORECASE,
 )
@@ -90,45 +82,47 @@ PRICE_RE = re.compile(
 )
 
 DISCOUNT_RE = re.compile(
-    r"(?:sconto(?:\s+del)?\s*)"
-    r"(\d{1,2})\s*%"
+    r"(?:sconto(?:\s+del)?\s*)(\d{1,2})\s*%"
     r"|(\d{1,2})\s*%\s*(?:di\s*)?sconto",
     re.IGNORECASE,
 )
 
 
-# ==================================================
-# STATO: EVITA NOTIFICHE DUPLICATE
-# ==================================================
+# =====================================================
+# STORICO NOTIFICHE
+# =====================================================
 
 def load_seen():
     try:
         if STATE_FILE.exists():
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            data = json.loads(
+                STATE_FILE.read_text(encoding="utf-8")
+            )
             if isinstance(data, list):
                 return set(data)
     except (OSError, json.JSONDecodeError) as exc:
-        logging.warning("Impossibile leggere lo storico: %s", exc)
+        logging.warning("Errore lettura storico: %s", exc)
 
     return set()
 
 
 def save_seen(seen):
     try:
-        # Mantiene lo storico limitato per non far crescere
-        # indefinitamente il file.
-        recent = sorted(seen)[-5000:]
         STATE_FILE.write_text(
-            json.dumps(recent, ensure_ascii=False, indent=2),
+            json.dumps(
+                sorted(seen)[-5000:],
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
     except OSError as exc:
-        logging.error("Impossibile salvare lo storico: %s", exc)
+        logging.error("Errore salvataggio storico: %s", exc)
 
 
-# ==================================================
-# TELEGRAM
-# ==================================================
+# =====================================================
+# INVIO TELEGRAM
+# =====================================================
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -142,89 +136,21 @@ def send_telegram(message):
         },
         timeout=REQUEST_TIMEOUT,
     )
-
     response.raise_for_status()
+
     result = response.json()
-
     if not result.get("ok"):
-        raise RuntimeError(
-            "Telegram non ha accettato il messaggio: "
-            + str(result.get("description", "errore sconosciuto"))
-        )
+        raise RuntimeError(result.get("description", "Errore Telegram"))
 
 
-# ==================================================
-# LETTURA DEI CANALI PUBBLICI
-# ==================================================
-
-def get_channel_posts(channel):
-    url = f"https://t.me/s/{channel}"
-
-    response = session.get(url, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    posts = []
-
-    for element in soup.select(".tgme_widget_message_wrap"):
-        text_element = element.select_one(".tgme_widget_message_text")
-
-        if not text_element:
-            continue
-
-        text = text_element.get_text(" ", strip=True)
-
-        if not text:
-            continue
-
-        date_element = element.select_one(
-            ".tgme_widget_message_date"
-        )
-
-        post_url = ""
-
-        if date_element and date_element.get("href"):
-            post_url = date_element["href"]
-
-        if not post_url:
-            data_post = element.select_one(
-                "[data-post]"
-            )
-            if data_post:
-                post_id = data_post.get("data-post", "")
-                if "/" in post_id:
-                    post_url = "https://t.me/" + post_id
-
-        # Estrae i link presenti nel messaggio originale.
-        links = []
-
-        for anchor in text_element.select("a[href]"):
-            href = anchor.get("href", "").strip()
-            if href:
-                normalized = normalize_amazon_link(href)
-                if normalized:
-                    links.append(normalized)
-
-        # Elimina link ripetuti senza cambiare l'ordine.
-        links = list(dict.fromkeys(links))
-
-        posts.append({
-            "text": text,
-            "links": links,
-            "url": post_url,
-        })
-
-    return posts[-POSTS_PER_CHANNEL:]
-
-
-# ==================================================
-# NORMALIZZAZIONE DEI LINK AMAZON
-# ==================================================
+# =====================================================
+# LINK AMAZON
+# =====================================================
 
 def normalize_amazon_link(url):
-    url = html.unescape(url.strip())
+    url = html.unescape((url or "").strip())
 
-    # Telegram può racchiudere il link in un redirect.
+    # Alcuni link sono racchiusi in redirect di Telegram.
     for _ in range(3):
         parsed = urlparse(url)
         query = parse_qs(parsed.query)
@@ -235,13 +161,14 @@ def normalize_amazon_link(url):
             or query.get("u")
         )
 
-        if wrapped:
-            candidate = unquote(wrapped[0])
-            if candidate.startswith(("http://", "https://")):
-                url = candidate
-                continue
+        if not wrapped:
+            break
 
-        break
+        candidate = unquote(wrapped[0])
+        if not candidate.startswith(("http://", "https://")):
+            break
+
+        url = candidate
 
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
@@ -255,39 +182,181 @@ def normalize_amazon_link(url):
     return None
 
 
-# ==================================================
-# SEPARAZIONE DEI PRODOTTI
-# ==================================================
+def collect_link_nodes(text_element):
+    """
+    Estrae i link Amazon con il testo circostante.
+    Conserva la posizione di ciascun link nel messaggio.
+    """
+
+    full_text = text_element.get_text(" ", strip=False)
+    results = []
+
+    for anchor in text_element.select("a[href]"):
+        href = anchor.get("href", "")
+        link = normalize_amazon_link(href)
+
+        if not link:
+            continue
+
+        anchor_text = anchor.get_text(" ", strip=True)
+
+        # Posizione approssimativa del link nel testo.
+        # I messaggi Telegram possono contenere link con testo
+        # visibile diverso dall'URL effettivo.
+        visible = anchor.get_text(" ", strip=False)
+        position = full_text.find(visible) if visible else -1
+
+        results.append({
+            "url": link,
+            "text": anchor_text,
+            "position": position,
+        })
+
+    return full_text, results
+
+
+# =====================================================
+# LETTURA CANALI
+# =====================================================
+
+def get_channel_posts(channel):
+    url = f"https://t.me/s/{channel}"
+    response = session.get(url, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    posts = []
+
+    for element in soup.select(".tgme_widget_message_wrap"):
+        text_element = element.select_one(
+            ".tgme_widget_message_text"
+        )
+
+        if not text_element:
+            continue
+
+        text, links = collect_link_nodes(text_element)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        if not text:
+            continue
+
+        date_element = element.select_one(
+            ".tgme_widget_message_date"
+        )
+
+        post_url = (
+            date_element.get("href", "")
+            if date_element else ""
+        )
+
+        if not post_url:
+            data_post = element.select_one("[data-post]")
+            if data_post:
+                post_id = data_post.get("data-post", "")
+                if "/" in post_id:
+                    post_url = "https://t.me/" + post_id
+
+        posts.append({
+            "text": text,
+            "links": links,
+            "url": post_url,
+        })
+
+    return posts[-POSTS_PER_CHANNEL:]
+
+
+# =====================================================
+# DIVISIONE DEI PRODOTTI
+# =====================================================
 
 def split_products(text):
-    # I canali di offerte spesso separano i prodotti con 📌.
+    # Formato più comune nei canali di offerte.
     if "📌" in text:
         chunks = re.split(r"📌", text)
-        products = [chunk.strip() for chunk in chunks if chunk.strip()]
-
+        products = [
+            chunk.strip()
+            for chunk in chunks
+            if chunk.strip()
+        ]
         if len(products) > 1:
             return products
 
-    # Formato alternativo: 1) prodotto, 2) prodotto...
-    numbered = re.split(r"(?<!\d)\s+\d{1,2}\s*[).]\s+", text)
+    # Formato numerato: 1) prodotto, 2) prodotto...
+    numbered = re.split(
+        r"(?<!\d)\s+\d{1,2}\s*[).]\s+",
+        text,
+    )
 
-    products = [chunk.strip() for chunk in numbered if chunk.strip()]
-
+    products = [x.strip() for x in numbered if x.strip()]
     if len(products) > 1:
         return products
 
     return [text.strip()]
 
 
-# ==================================================
+def assign_links(products, links):
+    """
+    Associa i link ai blocchi prodotto usando le posizioni
+    nel testo originale quando disponibili.
+
+    Se le posizioni non sono utilizzabili, non abbina
+    arbitrariamente link a prodotti diversi.
+    """
+
+    if not products or not links:
+        return []
+
+    if len(products) == 1:
+        # Un singolo blocco può contenere più link.
+        # Preferisce il primo link Amazon; gli altri potrebbero
+        # essere link accessori o ulteriori destinazioni.
+        return [(products[0], links[0]["url"])]
+
+    if len(products) == len(links):
+        return [
+            (product, link["url"])
+            for product, link in zip(products, links)
+        ]
+
+    # Conteggi diversi: cerca di associare il link al blocco
+    # prodotto che contiene il suo testo visibile.
+    assigned = []
+    used_links = set()
+
+    for product in products:
+        product_lower = product.lower()
+        candidates = []
+
+        for index, link in enumerate(links):
+            if index in used_links:
+                continue
+
+            visible = (link.get("text") or "").strip().lower()
+
+            # Se il testo visibile del link contiene informazioni
+            # sul prodotto, è una corrispondenza utile.
+            if visible and len(visible) > 5:
+                if visible in product_lower:
+                    candidates.append(index)
+
+        if len(candidates) == 1:
+            index = candidates[0]
+            used_links.add(index)
+            assigned.append((product, links[index]["url"]))
+
+    # Non inventa associazioni per i prodotti rimasti senza link.
+    return assigned
+
+
+# =====================================================
 # PREZZI E SCONTI
-# ==================================================
+# =====================================================
 
 def parse_number(value):
     value = value.strip().replace(" ", "")
 
     if "," in value and "." in value:
-        # Esempio: 1.299,99
         if value.rfind(",") > value.rfind("."):
             value = value.replace(".", "").replace(",", ".")
         else:
@@ -305,13 +374,14 @@ def extract_prices(text):
     prices = []
 
     for match in PRICE_RE.finditer(text):
-        raw = next((group for group in match.groups() if group), None)
-
+        raw = next(
+            (group for group in match.groups() if group),
+            None,
+        )
         if raw is None:
             continue
 
         price = parse_number(raw)
-
         if price is not None and 1 <= price <= 10000:
             prices.append(price)
 
@@ -322,50 +392,45 @@ def extract_discount(text, prices):
     match = DISCOUNT_RE.search(text)
 
     if match:
-        raw = next((group for group in match.groups() if group), None)
+        raw = next(
+            (group for group in match.groups() if group),
+            None,
+        )
         if raw:
             return int(raw)
 
-    # Se non è scritto lo sconto, prova a calcolarlo dai prezzi.
-    # Si usa il prezzo maggiore come prezzo precedente e il minore
-    # come prezzo attuale, ma solo quando ci sono almeno due prezzi.
     if len(prices) >= 2:
         old_price = max(prices)
         new_price = min(prices)
 
         if old_price > new_price:
-            return round((old_price - new_price) / old_price * 100)
+            return round(
+                (old_price - new_price) / old_price * 100
+            )
 
     return None
 
 
 def extract_current_price(text, prices):
-    # Preferisce il prezzo vicino a parole come "ora", "oggi",
-    # "prezzo" o "solo". Altrimenti usa il prezzo più basso
-    # trovato, scelta prudente per i controlli sul budget.
-    current_patterns = [
+    patterns = [
         r"(?:ora|oggi|adesso|solo|prezzo attuale)"
         r"\s*[:\-]?\s*(?:€\s*)?(\d{1,4}(?:[.,]\d{1,2})?)\s*€?",
         r"(?:💵|💰)\s*(?:€\s*)?(\d{1,4}(?:[.,]\d{1,2})?)\s*€?",
     ]
 
-    for pattern in current_patterns:
+    for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
-
         if match:
             price = parse_number(match.group(1))
             if price is not None and 1 <= price <= 10000:
                 return price
 
-    if prices:
-        return min(prices)
-
-    return None
+    return min(prices) if prices else None
 
 
-# ==================================================
-# FILTRO E COSTRUZIONE DELL'OFFERTA
-# ==================================================
+# =====================================================
+# CONTROLLO PRODOTTI
+# =====================================================
 
 def is_robot_product(text):
     if not ROBOT_RE.search(text):
@@ -377,14 +442,6 @@ def is_robot_product(text):
     return True
 
 
-def product_key(channel, post_url, product_text, link):
-    # L'identificatore del link rende stabile la deduplicazione.
-    identity = link or product_text
-    raw = f"{channel}|{post_url}|{identity}".lower()
-
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
 def build_deal(channel, product_text, link, post_url):
     if not is_robot_product(product_text):
         return None
@@ -393,115 +450,73 @@ def build_deal(channel, product_text, link, post_url):
     current_price = extract_current_price(product_text, prices)
     discount = extract_discount(product_text, prices)
 
-    if current_price is None:
-        logging.info(
-            "Robot ignorato: prezzo non riconosciuto (%s)",
-            channel,
-        )
-        return None
-
-    if current_price > MAX_PRICE:
+    if current_price is None or current_price > MAX_PRICE:
         return None
 
     if discount is None or discount < MIN_DISCOUNT:
         return None
 
-    product_name = re.sub(r"\s+", " ", product_text).strip()
+    name = re.sub(r"\s+", " ", product_text).strip()
+    if len(name) > 450:
+        name = name[:447] + "..."
 
-    # Accorcia il testo per mantenere le notifiche leggibili.
-    if len(product_name) > 450:
-        product_name = product_name[:447] + "..."
+    if not link:
+        link = post_url
 
-    product_link = link or post_url
-
-    if not product_link:
-        logging.info(
-            "Robot ignorato: manca un link utilizzabile (%s)",
-            channel,
-        )
+    if not link:
         return None
 
     return {
-        "name": product_name,
+        "name": name,
         "price": current_price,
         "discount": discount,
-        "link": product_link,
+        "link": link,
         "channel": channel,
-        "post_url": post_url,
     }
 
 
-# ==================================================
-# ASSOCIAZIONE PRODOTTI E LINK
-# ==================================================
+def make_key(channel, post_url, name, link):
+    identity = link or name
+    raw = f"{channel}|{post_url}|{identity}".lower()
 
-def pair_products_and_links(products, links):
-    """
-    Se ogni prodotto ha un link, li abbina in ordine.
-
-    Se i conteggi non coincidono, non associa alla cieca i link
-    ai prodotti: restituisce soltanto le associazioni non ambigue.
-    Questo evita di inviare un'offerta con il link sbagliato.
-    """
-
-    if not products or not links:
-        return []
-
-    if len(products) == len(links):
-        return list(zip(products, links))
-
-    logging.warning(
-        "Conteggi diversi: %s prodotti e %s link. "
-        "Il post sarà controllato senza abbinamenti rischiosi.",
-        len(products),
-        len(links),
-    )
-
-    # Se esiste un solo prodotto e un solo link, l'associazione è chiara.
-    if len(products) == 1 and len(links) == 1:
-        return [(products[0], links[0])]
-
-    # In caso di dubbio, non inventare l'associazione.
-    # I post con più prodotti e conteggi diversi vengono lasciati
-    # senza abbinamento, invece di associare link errati.
-    return []
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()
 
 
-# ==================================================
-# CONTROLLO DEI CANALI
-# ==================================================
+# =====================================================
+# CONTROLLO CANALI
+# =====================================================
 
 def check_channel(channel, seen):
     logging.info("Controllo canale: @%s", channel)
 
-    new_notifications = 0
-    skipped = 0
+    notifications = 0
+    ambiguous = 0
 
     try:
         posts = get_channel_posts(channel)
-    except (requests.RequestException, ValueError) as exc:
-        logging.error(
-            "Impossibile leggere @%s: %s",
-            channel,
-            exc,
-        )
-        return new_notifications, skipped
+    except requests.RequestException as exc:
+        logging.error("Errore lettura @%s: %s", channel, exc)
+        return notifications, ambiguous
 
     for post in posts:
         text = post["text"]
 
-        # Non serve analizzare messaggi che non contengono
-        # neanche una parola riconducibile a un robot.
         if not ROBOT_RE.search(text):
             continue
 
         products = split_products(text)
         links = post["links"]
-
-        pairs = pair_products_and_links(products, links)
+        pairs = assign_links(products, links)
 
         if not pairs:
-            skipped += 1
+            ambiguous += 1
+            logging.warning(
+                "@%s: impossibile associare i link del post %s",
+                channel,
+                post["url"] or "(URL non disponibile)",
+            )
             continue
 
         for product_text, link in pairs:
@@ -515,7 +530,7 @@ def check_channel(channel, seen):
             if not deal:
                 continue
 
-            key = product_key(
+            key = make_key(
                 channel,
                 post["url"],
                 deal["name"],
@@ -537,63 +552,54 @@ def check_channel(channel, seen):
             try:
                 send_telegram(message)
             except (requests.RequestException, RuntimeError) as exc:
-                logging.error(
-                    "Errore invio Telegram: %s",
-                    exc,
-                )
-                # Non segnare come inviato: sarà ritentato
-                # al prossimo controllo.
+                logging.error("Errore invio Telegram: %s", exc)
                 continue
 
             seen.add(key)
             save_seen(seen)
-            new_notifications += 1
+            notifications += 1
 
             logging.info(
                 "Notifica inviata da @%s",
                 channel,
             )
-
             time.sleep(1)
 
     logging.info(
-        "@%s: nuove notifiche %s, "
-        "post con associazione ambigua %s",
+        "@%s: nuove notifiche %s, post ambigui %s",
         channel,
-        new_notifications,
-        skipped,
+        notifications,
+        ambiguous,
     )
 
-    return new_notifications, skipped
+    return notifications, ambiguous
 
 
-# ==================================================
+# =====================================================
 # AVVIO
-# ==================================================
+# =====================================================
 
 def main():
     seen = load_seen()
 
     total_notifications = 0
-    total_skipped = 0
+    total_ambiguous = 0
 
     for channel in SOURCE_CHANNELS:
-        notifications, skipped = check_channel(channel, seen)
-
+        notifications, ambiguous = check_channel(channel, seen)
         total_notifications += notifications
-        total_skipped += skipped
+        total_ambiguous += ambiguous
 
     logging.info(
         "Controllo completato. Nuove notifiche: %s",
         total_notifications,
     )
-
     logging.info(
         "Post con associazione ambigua: %s",
-        total_skipped,
+        total_ambiguous,
     )
 
 
 if __name__ == "__main__":
     main()
-
+```
