@@ -24,7 +24,14 @@ HEADERS = {
 }
 
 ROBOT_RE = re.compile(
-    r"\b(robot|aspirapolvere|aspira.?lava|lavapavimenti)\b",
+    r"\b(robot aspirapolvere|robot lavapavimenti|"
+    r"robot aspirapolvere e lavapavimenti|"
+    r"robot aspirapolvere lavapavimenti|"
+    r"robot aspirapolvere e lava pavimenti|"
+    r"robot vacuum|robot mop|robot vacuum cleaner|"
+    r"robot lavapavimenti automatico|"
+    r"roborock|roomba|dreame|ecovacs|"
+    r"eufy|narwal|yeedi|lubluelu)\b",
     re.IGNORECASE,
 )
 
