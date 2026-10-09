@@ -8,11 +8,11 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 
-# Segreti GitHub già configurati: non inserire qui il token
+# Segreti GitHub già configurati
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
-# Canali Telegram da controllare
+# Quattro canali da controllare
 SOURCE_CHANNELS = [
     channel.strip().lstrip("@")
     for channel in os.getenv(
@@ -32,28 +32,43 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; RobotDealBot/1.0)"
 }
 
-# Richiede un riferimento esplicito a un robot
+# Riconosce robot e modelli comunemente venduti come robot.
+# Il riconoscimento si basa sul testo e non garantisce
+# che ogni modello sia effettivamente autonomo.
 ROBOT_RE = re.compile(
-    r"\b(robot|robotico|robotica|robotizzati|robotizzata)\b",
+    r"\b("
+    r"robot|robovac|"
+    r"roborock|roomba|"
+    r"ecovacs|narwal|yeedi|"
+    r"lubluelu|"
+    r"dreame\s*(?:l\d|x\d|d\d|f\d|matrix|l\d{2})|"
+    r"eufy\s*(?:clean|robovac|omni)|"
+    r"lefant\s*(?:m\d|n\d|t\d)|"
+    r"xiaomi\s*(?:robot|robot vacuum)"
+    r")\b",
     re.IGNORECASE,
 )
 
-# Esclude prodotti manuali riconoscibili
+# Esclude alcuni aspirapolvere/lavapavimenti manuali noti.
+# Evitiamo di escludere genericamente "senza fili",
+# perché anche alcuni robot possono essere descritti così.
 MANUAL_RE = re.compile(
-    r"\b(tineco|floor\s*one|scopa elettrica|"
-    r"aspirapolvere a mano|aspirapolvere portatile|"
-    r"lavapavimenti manuale)\b",
+    r"\b("
+    r"tineco|floor\s*one|"
+    r"scopa elettrica|"
+    r"aspirapolvere a mano|"
+    r"aspirapolvere portatile|"
+    r"lavapavimenti manuale"
+    r")\b",
     re.IGNORECASE,
 )
 
-# Prezzi con simbolo euro, ad esempio 249,99 € o €249.99
 PRICE_RE = re.compile(
     r"€\s*(\d{1,4}(?:[.,]\d{1,2})?)"
     r"|(\d{1,4}(?:[.,]\d{1,2})?)\s*€",
     re.IGNORECASE,
 )
 
-# Riconosce sia "73% di sconto" sia "sconto del 73%"
 DISCOUNT_PATTERNS = [
     re.compile(
         r"(\d{1,3})\s*%\s*(?:di\s*)?sconto",
@@ -113,6 +128,7 @@ def extract_prices(text):
 
         try:
             price = parse_number(raw)
+
             if 1 <= price <= 10000:
                 prices.append(price)
         except ValueError:
@@ -126,14 +142,16 @@ def extract_discount(text, prices):
 
     for pattern in DISCOUNT_PATTERNS:
         match = pattern.search(text)
+
         if match:
             value = int(match.group(1))
+
             if 0 <= value <= 100:
                 discount = value
                 break
 
-    # Se il testo contiene prezzo attuale e prezzo precedente,
-    # prova a calcolare lo sconto.
+    # Calcola lo sconto anche se sono indicati due prezzi.
+    # Usa il primo prezzo come prezzo corrente.
     if len(prices) >= 2 and prices[1] > prices[0]:
         calculated = round(
             (prices[1] - prices[0]) / prices[1] * 100
@@ -162,7 +180,31 @@ def get_amazon_links(post):
 
 
 def split_products(text):
-    # Se il post è numerato, separa i prodotti.
+    # Formato con icone:
+    # 📌 prodotto
+    # 💵 prezzo
+    # 🔗 link
+    markers = list(re.finditer(r"📌", text))
+
+    if markers:
+        products = []
+
+        for index, marker in enumerate(markers):
+            start = marker.end()
+            end = (
+                markers[index + 1].start()
+                if index + 1 < len(markers)
+                else len(text)
+            )
+
+            block = text[start:end].strip()
+
+            if block:
+                products.append(block)
+
+        return products
+
+    # Formato numerato: 1), 2), 3)...
     markers = list(
         re.finditer(r"(?m)(?:^|\s)(\d{1,2})\)\s*", text)
     )
@@ -185,7 +227,7 @@ def split_products(text):
 
         return products
 
-    # Per i post non numerati, considera il post intero.
+    # Post non numerato con un solo robot riconoscibile.
     if ROBOT_RE.search(text):
         return [text]
 
@@ -193,7 +235,10 @@ def split_products(text):
 
 
 def send_telegram(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{BOT_TOKEN}/sendMessage"
+    )
 
     response = requests.post(
         url,
@@ -249,7 +294,8 @@ def check_channel(channel, sent):
         if not products or not links:
             continue
 
-        # Non associare prodotti e link se il numero differisce.
+        # Per non abbinare un prodotto al link sbagliato,
+        # richiediamo lo stesso numero di prodotti e link.
         if len(products) != len(links):
             skipped += 1
             continue
@@ -281,13 +327,14 @@ def check_channel(channel, sent):
             if current_price > MAX_PRICE:
                 continue
 
-            discount = extract_discount(product_text, prices)
+            discount = extract_discount(
+                product_text,
+                prices,
+            )
 
             if discount < MIN_DISCOUNT:
                 continue
 
-            # La stessa offerta trovata su più canali
-            # viene notificata una sola volta.
             fingerprint = hashlib.sha256(
                 f"{product_text}|{link}".encode("utf-8")
             ).hexdigest()[:20]
@@ -309,7 +356,10 @@ def check_channel(channel, sent):
 
             try:
                 send_telegram(message)
-            except (requests.RequestException, RuntimeError) as error:
+            except (
+                requests.RequestException,
+                RuntimeError,
+            ) as error:
                 print(f"Errore invio Telegram: {error}")
                 continue
 
@@ -339,7 +389,10 @@ def main():
     state["sent"] = list(sent)[-1000:]
     save_state(state)
 
-    print(f"Controllo completato. Nuove notifiche: {total_found}")
+    print(
+        f"Controllo completato. "
+        f"Nuove notifiche: {total_found}"
+    )
     print(
         "Post ignorati per link non associabili: "
         f"{total_skipped}"
