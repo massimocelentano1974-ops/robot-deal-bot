@@ -1,7 +1,7 @@
 
 name: Monitor offerte robot
 
-on:
+'on':
   workflow_dispatch:
   schedule:
     - cron: '17,47 * * * *'
