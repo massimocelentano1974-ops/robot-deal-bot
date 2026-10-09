@@ -18,7 +18,7 @@ SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "offertedale")
 SOURCE_URL = f"https://t.me/s/{SOURCE_CHANNEL}"
 
 # Regole delle offerte
-MAX_PRICE = 300.0
+MAX_PRICE = 350.0
 MIN_DISCOUNT = 50
 
 STATE_FILE = Path("state.json")
